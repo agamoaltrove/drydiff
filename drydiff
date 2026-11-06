@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+
+VERSION="1.0.0"
+
+usage() {
+  cat << 'USAGE'
+Usage: drydiff [-e "ssh ..."] [--rsh="ssh ..."] <src> <dst>
+
+Compare two paths (local or remote) using rsync in dry-run mode.
+Shows a compact summary of differences without transferring files.
+
+Options:
+  -e, --rsh CMD   Specify the remote shell command (passed to rsync -e)
+  --rsh=CMD       Same as --rsh CMD
+  -h, --help      Show this help
+  -v, --version   Show version
+
+Examples:
+  drydiff ./local/ ./backup/
+  drydiff -e "ssh -i ~/.ssh/id_ed25519 -p 2222" /home/user/data/ user@host:/backup/data/
+  drydiff --rsh="ssh -J jump@bastion" ./src/ user@host:/dst/
+
+Status legend:
+  +SRC   Present only on source
+  +DST   Present only on destination
+  DIFF   Content differs
+  META   Metadata differs (permissions, times, owner, group, etc.)
+
+Notes:
+  - Dry-run only (-n). No files are transferred or modified.
+  - Uses rsync with --checksum (-c) for accurate content comparison.
+  - Uses --delete to also report items present only on destination.
+  - A trailing slash on source affects comparison (content vs directory itself).
+  - Colors are disabled when NO_COLOR is set or stdout is not a TTY.
+
+This tool is a wrapper around rsync.
+USAGE
+}
+
+die() {
+  echo "drydiff: $*" >&2
+  exit 1
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  echo "drydiff $VERSION"
+  usage
+  exit 0
+fi
+
+if [ "${1:-}" = "-v" ] || [ "${1:-}" = "--version" ]; then
+  echo "drydiff $VERSION"
+  exit 0
+fi
+
+command -v rsync >/dev/null 2>&1 || die "rsync is required but not found in PATH"
+command -v awk >/dev/null 2>&1 || die "awk is required but not found in PATH"
+
+SSH_OPTS="ssh"
+RSH_SET=0
+ARGS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -e|--rsh)
+      shift
+      [ $# -eq 0 ] && { usage >&2; exit 1; }
+      SSH_OPTS="$1"
+      RSH_SET=1
+      shift
+      ;;
+    --rsh=*)
+      SSH_OPTS="${1#--rsh=}"
+      RSH_SET=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -v|--version)
+      echo "drydiff v$VERSION"
+      exit 0
+      ;;
+    --)
+      shift
+      while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done
+      break
+      ;;
+    -*)
+      usage >&2
+      exit 1
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+[ ${#ARGS[@]} -lt 2 ] && { usage >&2; exit 1; }
+
+SRC="${ARGS[0]}"
+DST="${ARGS[1]}"
+
+RSYNC_OPTS=(
+  -n
+  -avz
+  -c
+  --itemize-changes
+  --delete
+)
+
+if [[ "$SRC" == *:* || "$DST" == *:* || $RSH_SET -eq 1 ]]; then
+  RSYNC_OPTS+=(-e "$SSH_OPTS")
+fi
+
+USE_COLOR=1
+[ -n "${NO_COLOR:-}" ] && USE_COLOR=0
+[ -t 1 ] || USE_COLOR=0
+
+echo "DryDiff v$VERSION"
+echo "SRC: $SRC"
+echo "DST: $DST"
+if [[ "$SRC" == *:* || "$DST" == *:* || $RSH_SET -eq 1 ]]; then
+  echo "RSH: $SSH_OPTS"
+fi
+echo
+printf "%-1s  %-5s  %s\n" "T" "STAT" "PATH"
+echo "----------------------------------------"
+
+rsync "${RSYNC_OPTS[@]}" "$SRC" "$DST" 2>&1 | awk -v use_color="$USE_COLOR" '
+BEGIN {
+  if (use_color == "1") {
+    RED="\033[31m"; GRN="\033[32m"; YEL="\033[33m"; CYN="\033[36m"; RST="\033[0m";
+  } else {
+    RED=""; GRN=""; YEL=""; CYN=""; RST="";
+  }
+}
+/^[<>*+hc][fdLDcbpugtaxSL\?][cstpoguax\+\.\-!]*[ \t]+/ {
+  line = $0;
+  match(line, /^[^ \t]+/);
+  code = substr(line, RSTART, RLENGTH);
+  sub(/^[^ \t]+[ \t]+/, "", line);
+  path = line;
+
+  dir = substr(code, 1, 1);
+  typec = substr(code, 2, 1);
+  t = typec;
+
+  if (dir == "c") {
+    printf "%s%-1s  %-5s  %s%s\n", GRN, t, "+SRC", path, RST;
+    next;
+  }
+
+  if (dir == "+") {
+    printf "%s%-1s  %-5s  %s%s\n", GRN, t, "+SRC", path, RST;
+    next;
+  }
+
+  if (dir == ">") {
+    rest = substr(code, 3);
+    rest_clean = rest;
+    gsub(/[\. ]/, "", rest_clean);
+    if (rest_clean ~ /^\++$/) {
+      printf "%s%-1s  %-5s  %s%s\n", GRN, t, "+SRC", path, RST;
+      next;
+    }
+    if (rest_clean ~ /c/) {
+      printf "%s%-1s  %-5s  %s%s\n", YEL, t, "DIFF", path, RST;
+      next;
+    }
+    if (rest_clean == "") {
+      next;
+    }
+    printf "%s%-1s  %-5s  %s%s\n", CYN, t, "META", path, RST;
+    next;
+  }
+
+  if (dir == "<") {
+    rest = substr(code, 3);
+    rest_clean = rest;
+    gsub(/[\. ]/, "", rest_clean);
+    if (rest_clean ~ /^\++$/) {
+      printf "%s%-1s  %-5s  %s%s\n", GRN, t, "+SRC", path, RST;
+      next;
+    }
+    if (rest_clean ~ /c/) {
+      printf "%s%-1s  %-5s  %s%s\n", YEL, t, "DIFF", path, RST;
+      next;
+    }
+    if (rest_clean == "") {
+      next;
+    }
+    printf "%s%-1s  %-5s  %s%s\n", CYN, t, "META", path, RST;
+    next;
+  }
+
+  if (dir == "h") {
+    printf "%s%-1s  %-5s  %s%s\n", YEL, t, "DIFF", path, RST;
+    next;
+  }
+
+  if (dir == "*") {
+    if (code ~ /\*deleting/) {
+      printf "%s%-1s  %-5s  %s%s\n", RED, t, "+DST", path, RST;
+      next;
+    }
+    printf "%s%-1s  %-5s  %s%s\n", YEL, t, "DIFF", path, RST;
+    next;
+  }
+
+  if (dir == ".") {
+    rest = substr(code, 3);
+    rest_clean = rest;
+    gsub(/[\. ]/, "", rest_clean);
+    if (rest_clean == "") {
+      next;
+    }
+    if (rest_clean ~ /c/) {
+      printf "%s%-1s  %-5s  %s%s\n", YEL, t, "DIFF", path, RST;
+      next;
+    }
+    printf "%s%-1s  %-5s  %s%s\n", CYN, t, "META", path, RST;
+    next;
+  }
+
+  printf "%s%-1s  %-5s  %s%s\n", YEL, t, "DIFF", path, RST;
+  next;
+}
+/^\*deleting[ \t]+/ {
+  line = $0;
+  sub(/^\*deleting[ \t]+/, "", line);
+  printf "%s%-1s  %-5s  %s%s\n", RED, "f", "+DST", line, RST;
+  next;
+}
+/^(sending incremental file list|building file list|^total size|^$)/ { next; }
+/^(rsync:|rsync error:|IO error|file has vanished:|skipping|WARNING:)/ { print $0 > "/dev/stderr"; next; }
+{ print $0 > "/dev/stderr"; }
+'
+rc=$?
+exit $rc
