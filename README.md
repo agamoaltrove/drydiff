@@ -27,13 +27,13 @@ It wraps `rsync` and presents a compact, readable summary of differences without
 
 ```bash
 # Make executable
-chmod +x drydiff
+chmod +x drydiff.sh
 
-# Symlink into PATH
-ln -s /path/to/drydiff ~/.local/bin/drydiff
+# Symlink into PATH (recommended)
+ln -s /path/to/drydiff.sh ~/.local/bin/drydiff
 
 # Or add an alias
-echo "alias drydiff='/path/to/drydiff'" >> ~/.bashrc
+echo "alias drydiff='/path/to/drydiff.sh'" >> ~/.bashrc
 ```
 
 ## Usage
